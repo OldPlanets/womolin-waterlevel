@@ -38,6 +38,8 @@
 #include <Preferences.h>
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+#include <Ticker.h>
 
 // Power Management
 #include <driver/rtc_io.h>
@@ -56,18 +58,19 @@ Adafruit_BMP085_Unified bmp180 = Adafruit_BMP085_Unified(10085);
 bool bmp180_found = false;
 
 WebSerialClass WebSerial;
+Ticker wifiTimer;
+#ifdef ONBOARD_LED
+Ticker statusLedTimer;
+#endif
 
 void initWifiAndServices() {
-  if (enableOtaWebUpdate) {
-    otaWebUpdater.setFirmware(AUTO_FW_DATE, AUTO_FW_VERSION);
-    otaWebUpdater.startBackgroundTask();
-    otaWebUpdater.attachWebServer(&webServer);
-  }
 
-  // Load well known Wifi AP credentials from NVS
+  // Load well known Wifi AP credentials from NVS  
+  LOG_INFO_F("SoftAP Password '%s'\n", preferences.getString("softAPPassword", ""));
+  WifiManager.fallbackToSoftAp(preferences.getBool("enableSoftAp", true), hostname, preferences.getString("softAPPassword", ""));
   WifiManager.startBackgroundTask();
   WifiManager.attachWebServer(&webServer);
-  WifiManager.fallbackToSoftAp(preferences.getBool("enableSoftAp", true));
+
 
   WebSerial.begin(&webServer);
 
@@ -96,20 +99,38 @@ void initWifiAndServices() {
 }
 
 void setup() {
+  bool isDeepSleepWakeup = esp_sleep_get_wakeup_cause() != 0;
+  bool isWakeUpByTimer = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
+
   Serial.begin(115200);
   Serial.setDebugOutput(true);
-
-  LOG_INFO_LN(F("\n\n==== starting ESP32 setup() ===="));
-  LOG_INFO_F("Firmware build date: %s %s\n", __DATE__, __TIME__);
-  LOG_INFO_F("Firmware Version: %s (%s)\n", AUTO_FW_VERSION, AUTO_FW_DATE);
-
   print_wakeup_reason();
-  LOG_INFO_F("[SETUP] Configure ESP32 to sleep for every %d Seconds\n", TIME_TO_SLEEP);
 
+  if (!isDeepSleepWakeup)
+  {
+    LOG_INFO_LN(F("\n\n==== starting ESP32 setup() ===="));
+    LOG_INFO_F("Firmware build date: %s %s\n", __DATE__, __TIME__);
+    LOG_INFO_F("Firmware Version: %s (%s)\n", AUTO_FW_VERSION, AUTO_FW_DATE);
+    LOG_INFO_F("[SETUP] Configure ESP32 to sleep for every %d Seconds\n", TIME_TO_SLEEP);
+  }
+
+  #if (HIGH_ON_START_PIN > 0)
+  pinMode(HIGH_ON_START_PIN, OUTPUT); 
+  digitalWrite(HIGH_ON_START_PIN, HIGH);
+  #endif
+
+  #ifdef ONBOARD_LED
+  pinMode(ONBOARD_LED, OUTPUT);
+  #endif
+
+  #if HAS_BUTTON_INSTALLED
   LOG_INFO_F("[GPIO] Configuration of GPIO %d as INPUT_PULLUP ... ", button1.PIN);
   pinMode(button1.PIN, INPUT_PULLUP);
   attachInterrupt(button1.PIN, ISR_button1, FALLING);
   LOG_INFO_LN(F("done"));
+  #else
+  LOG_INFO_LN("[GPIO] No WiFi button build");
+  #endif
     
   if (!LittleFS.begin(true)) {
     LOG_INFO_LN(F("[FS] An Error has occurred while mounting LittleFS"));
@@ -122,21 +143,14 @@ void setup() {
 
   float currentPressure = 0.f;
   sensors_event_t event;
+
+  Wire.begin(BMP180_SDA_PIN, BMP180_SCL_PIN);
   bmp180_found = bmp180.begin(BMP085_MODE_ULTRAHIGHRES);
   if (!bmp180_found) LOG_INFO_LN(F("[BMP180] Chip not found, disabling temperature and pressure"));
   else {
     bmp180.getEvent(&event);
-    if (event.pressure) currentPressure = event.pressure; // hPa
-  }
-
-  for (uint8_t i=0; i < LEVELMANAGERS; i++) {
-    LevelManagers[i]->setAutomaticAirPump(preferences.getBool("autoAirPump", true));
-    LevelManagers[i]->setAirPressureThreshold(preferences.getUInt("pressureThresh", 10));
-    LevelManagers[i]->setAirPressure(currentPressure, false);
-    if (preferences.getBool("airPumpOnBoot", true)) {
-      LevelManagers[i]->activateAirPump();
-    }
-    LevelManagers[i]->begin((String(NVS_NAMESPACE) + String("s") + String(i)).c_str());
+    if (event.pressure)currentPressure = event.pressure; // hPa
+    LOG_INFO_F("[BMP180] Chip found, initial pressure reading: %fhPa\n", event.pressure);
   }
 
   // Load Settings from NVS
@@ -145,53 +159,110 @@ void setup() {
     hostname = "waterlevel";
     preferences.putString("hostname", hostname);
   }
-  enableWifi = preferences.getBool("enableWifi", enableWifi);
-  enableBle = preferences.getBool("enableBle", enableBle);
-  enableDac = preferences.getBool("enableDac", enableDac);
-  enableMqtt = preferences.getBool("enableMqtt", enableMqtt);
-  enableOtaWebUpdate = preferences.getBool("otaWebEnabled", enableOtaWebUpdate);
 
-  if (!preferences.getString("otaWebUrl").isEmpty()) {
-    otaWebUpdater.setBaseUrl(preferences.getString("otaWebUrl"));
+  enableBle = preferences.getBool("enableBle", enableBle);
+  #if HAS_DAC_INSTALLED
+  enableDac = preferences.getBool("enableDac", enableDac);
+  #endif
+  enableMqtt = preferences.getBool("enableMqtt", enableMqtt);
+  
+  if (!isWakeUpByTimer)
+  { 
+    #if HAS_BUTTON_INSTALLED // Don't allow wifi to get turned off forever if there is no button
+    enableWifi = preferences.getBool("enableWifi", enableWifi);
+    #else
+    enableWifi = true;
+    #endif
+    
+    if (!isDeepSleepWakeup)
+    {
+      shutDownWifiMin = preferences.getUShort("shutDownWifiMin", 0);
+      if (enableWifi && shutDownWifiMin > 0)
+      {
+        LOG_INFO_F("[WIFI] Wifi will be turned off in %d minutes\n", shutDownWifiMin);
+        wifiTimer.once(shutDownWifiMin * 60, []() {
+            if (otaRunning) return;
+            LOG_INFO_LN(F("[WIFI] Shutting down due to timer!"));
+            enableWifi = false;
+            webServer.end();
+            MDNS.end();
+            Mqtt.disconnect();
+            WifiManager.stopWifi(true);
+            WiFi.mode(WIFI_OFF);
+        });
+      }
+    }
+  }
+  else
+  {
+    enableWifi = false;  
   }
 
   if (enableWifi) initWifiAndServices();
-  else LOG_INFO_LN(F("[WIFI] Not starting WiFi!"));
+    else LOG_INFO_LN(F("[WIFI] Not starting WiFi!"));
 
   if (enableBle) createBleServer(hostname);
   else LOG_INFO_LN(F("[BLE] Bluetooth low energy is disabled."));
+  
+  if (enableWifi)
+  {
+    String otaPassword = preferences.getString("otaPassword");
+    if (otaPassword.isEmpty()) {
+      otaPassword = String((uint32_t)ESP.getEfuseMac());
+      preferences.putString("otaPassword", otaPassword);
+    }
+    LOG_INFO_F("[OTA] Password set to '%s'\n", otaPassword);
 
-  String otaPassword = preferences.getString("otaPassword");
-  if (otaPassword.isEmpty()) {
-    otaPassword = String((uint32_t)ESP.getEfuseMac());
-    preferences.putString("otaPassword", otaPassword);
+    ArduinoOTA
+      .setHostname(hostname.c_str())
+      .setPassword(otaPassword.c_str())
+      .onStart([]() {
+        String type;
+        if (ArduinoOTA.getCommand() == U_FLASH) type = "sketch";
+        else {
+          type = "filesystem";
+          LittleFS.end();
+        }
+        otaRunning = true;
+        LOG_INFO_LN("Start updating " + type);
+      })
+      .onEnd([]() {
+        otaRunning = false;
+        LOG_INFO_LN("\nEnd");
+      })
+      .onProgress([](unsigned int progress, unsigned int total) {
+        //LOG_INFO_F("Progress: %u%%\r", (progress / (total / 100)));
+      })
+      .onError([](ota_error_t error) {
+        otaRunning = false;
+        LOG_INFO_F("Error[%u]: ", error);
+        if (error == OTA_AUTH_ERROR) LOG_INFO_LN("Auth Failed");
+        else if (error == OTA_BEGIN_ERROR) LOG_INFO_LN("Begin Failed");
+        else if (error == OTA_CONNECT_ERROR) LOG_INFO_LN("Connect Failed");
+        else if (error == OTA_RECEIVE_ERROR) LOG_INFO_LN("Receive Failed");
+        else if (error == OTA_END_ERROR) LOG_INFO_LN("End Failed");
+      });
+
+    ArduinoOTA.begin();
   }
-  otaWebUpdater.setOtaPassword(otaPassword);
-  LOG_INFO_F("[OTA] Password set to '%s'\n", otaPassword);
-
-  preferences.end();
 
   for (uint8_t i=0; i < LEVELMANAGERS; i++) {
-    if (!LevelManagers[i]->isConfigured()) {
-      // we need to bring up WiFi to provide a convenient setup routine
-      enableWifi = true;
+    LevelManagers[i]->setAutomaticAirPump(preferences.getBool("autoAirPump", true));
+    LevelManagers[i]->setAirPressureThreshold(preferences.getUInt("pressureThresh", 10));
+    LevelManagers[i]->setAirPressure(currentPressure, false);
+    if (!isDeepSleepWakeup && preferences.getBool("airPumpOnBoot", true)) {
+      LevelManagers[i]->activateAirPump();
     }
+    LevelManagers[i]->begin((String(NVS_NAMESPACE) + String("s") + String(i)).c_str());
   }
-}
 
-// Soft reset the ESP to start with setup() again, but without loosing RTC_DATA as it would be with ESP.reset()
-void softReset() {
-  if (enableWifi) {
-    webServer.end();
-    MDNS.end();
-    Mqtt.disconnect();
-    WifiManager.stopWifi();
-  }
-  esp_sleep_enable_timer_wakeup(1);
-  esp_deep_sleep_start();
+  preferences.end();
+  
 }
 
 void loop() {
+  ArduinoOTA.handle();
+  #if HAS_BUTTON_INSTALLED
   if (button1.pressed) {
     LOG_INFO_LN(F("[EVENT] Button pressed!"));
     button1.pressed = false;
@@ -201,13 +272,13 @@ void loop() {
     } else {
       initWifiAndServices();
     }
-    // softReset();
   }
+  #endif
 
   // Do not continue regular operation as long as a OTA is running
   // Reason: Background workload can cause upgrade issues that we want to avoid!
-  if (otaWebUpdater.otaIsRunning) return sleepOrDelay();
-
+  if (otaRunning) return sleepOrDelay();
+  
   if (runtime() - Timing.lastServiceCheck > Timing.serviceInterval) {
     Timing.lastServiceCheck = runtime();
     // Check if all the services work
@@ -221,6 +292,18 @@ void loop() {
   // run regular operation
   if (runtime() - Timing.lastStatusUpdate > Timing.statusUpdateInterval) {
     Timing.lastStatusUpdate = runtime();
+
+    #ifdef ONBOARD_LED
+    if (enableWifi && WiFi.status() == WL_CONNECTED && WiFi.getMode() & WIFI_MODE_STA) {
+      digitalWrite(ONBOARD_LED, HIGH);
+      statusLedTimer.once_ms(50, []() { digitalWrite(ONBOARD_LED, LOW); });    
+    }
+    else if (enableWifi && WifiManager.isFallbackAPRunning())
+    {
+      digitalWrite(ONBOARD_LED, HIGH);
+      statusLedTimer.once_ms(1000, []() { digitalWrite(ONBOARD_LED, LOW); });    
+    }
+    #endif
 
     String jsonOutput;
     StaticJsonDocument<1024> jsonDoc;
@@ -236,7 +319,7 @@ void loop() {
     for (uint8_t i=0; i < LEVELMANAGERS; i++) {
       // Update air pressure value on all levelmanagers
       // 101.325 Pa = 101,325 kPa = 1013,25 hPa ≈ 1 bar.
-      LevelManagers[i]->setAirPressure(event.pressure);
+      LevelManagers[i]->setAirPressure(roundf(event.pressure));
 
       if (LevelManagers[i]->isConfigured()) {
         String ident = String("level") + String(i);
@@ -256,6 +339,8 @@ void loop() {
         jsonDoc[i]["sensorPressure"] = LevelManagers[i]->getLastMedian();
         jsonDoc[i]["airPressure"] = event.pressure;
         jsonDoc[i]["temperature"] = temperature;
+        jsonDoc[i]["error"] = LevelManagers[i]->getSensorError();
+        jsonDoc[i]["configured"] = true;
 
         LOG_INFO_F("[SENSOR] Current level of %d. sensor is %d%% (raw %d, calculated %d)\n",
           i+1, LevelManagers[i]->getLevel(), (int)LevelManagers[i]->lastRawReading, LevelManagers[i]->getLastMedian()
@@ -263,16 +348,19 @@ void loop() {
       } else {
         if (enableDac) dacValue(i+1, 0);
         if (enableBle) updateBleCharacteristic(i+1, 0);
-        int tmp = LevelManagers[i]->getCalulcatedMedianReading();
 
         jsonDoc[i]["id"] = i;
-        jsonDoc[i]["sensorValue"] = tmp;
+        jsonDoc[i]["level"] = 0;
+        jsonDoc[i]["volume"] = 0;
+        jsonDoc[i]["sensorPressure"] = LevelManagers[i]->getLastMedian();
         jsonDoc[i]["airPressure"] = event.pressure;
         jsonDoc[i]["temperature"] = temperature;
+        jsonDoc[i]["error"] = LevelManagers[i]->getSensorError();
+        jsonDoc[i]["configured"] = false;
 
-        LOG_INFO_F("[SENSOR] Sensor %d not configured, please run the setup! (raw %d, calculated %d)\n",
-          i+1, (int)LevelManagers[i]->lastRawReading, LevelManagers[i]->getLastMedian()
-        );
+        // LOG_INFO_F("[SENSOR] Sensor %d not configured, please run the setup! (raw %d, calculated %d)\n",
+        //   i+1, (int)LevelManagers[i]->lastRawReading, LevelManagers[i]->getLastMedian()
+        // );
       }
     }
 
@@ -281,4 +369,52 @@ void loop() {
     //LOG_INFO_LN(jsonOutput);
   }
   sleepOrDelay();
+}
+
+void sleepOrDelay() {
+  for (uint8_t i=0; i < LEVELMANAGERS; i++) {
+    if (!LevelManagers[i]->canSleep()) {
+      yield();
+      delay(50);
+      return;
+    }
+  }
+  if (enableWifi || enableMqtt || (enableBle && (shouldBleStayOn() || !enableBleSleep))) {
+    yield();
+    delay(50);
+  } else {
+    // We can save a lot of power by going into deepsleep
+    // This disables WIFI and everything.
+    esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+    sleepTime = rtc_time_slowclk_to_us(rtc_time_get(), esp_clk_slowclk_cal_get());
+    #if HAS_BUTTON_INSTALLED
+    rtc_gpio_pullup_en(button1.PIN);
+    rtc_gpio_pulldown_dis(button1.PIN);
+    esp_sleep_enable_ext0_wakeup(button1.PIN, 0);
+    #endif
+
+    LOG_INFO_LN(F("[POWER] Deep Sleeping..."));
+    if (enableBle)
+    {
+      stopBleServer();
+    }
+    for (uint8_t i=0; i < LEVELMANAGERS; i++) {
+      LevelManagers[i]->powerDownSensor();
+    }
+    preferences.end();
+    esp_deep_sleep_start();
+    /*
+    At least for sporadic BLE advertisement the power consumption with light sleep is not that much higher than deep sleep
+    So if we ever decided keeping our RAM and so on might be of advantage, it would be an easy switch
+
+    esp_light_sleep_start();
+    if (enableBle)
+    {
+      createBleServer(hostname);
+    }
+    for (uint8_t i=0; i < LEVELMANAGERS; i++) {
+      LevelManagers[i]->powerUpSensor();
+    }
+    */    
+  }
 }

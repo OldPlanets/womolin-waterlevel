@@ -8,10 +8,10 @@ export function GET() {
 		enableMqtt: true,
 		enableSoftAp: true,
 		enableWifi: true,
+		shutDownWifiMin: 0,
 		autoAirPump: true,
 		otaPassword: 'abcd1234567890',
-		otaWebUrl: 'http://s3.womolin.de/webinstaller/test/',
-		otaWebEnabled: true,
+		softAPPassword: '',
 		hostname: 'freshwater',
 		mqttHost: '192.168.255.1',
 		mqttPass: 'abcd1234',
@@ -31,11 +31,11 @@ export async function POST({ request }) {
 		!Object.prototype.hasOwnProperty.call(data, 'enableDac') ||
 		!Object.prototype.hasOwnProperty.call(data, 'enableMqtt') ||
 		!Object.prototype.hasOwnProperty.call(data, 'enableSoftAp') ||
+		!Object.prototype.hasOwnProperty.call(data, 'softAPPassword') ||
 		!Object.prototype.hasOwnProperty.call(data, 'enableWifi') ||
+		!Object.prototype.hasOwnProperty.call(data, 'shutDownWifiMin') ||		
 		!Object.prototype.hasOwnProperty.call(data, 'autoAirPump') ||
 		!Object.prototype.hasOwnProperty.call(data, 'otaPassword') ||
-		!Object.prototype.hasOwnProperty.call(data, 'otaWebUrl') ||
-		!Object.prototype.hasOwnProperty.call(data, 'otaWebEnabled') ||
 		!Object.prototype.hasOwnProperty.call(data, 'hostname') ||
 		!Object.prototype.hasOwnProperty.call(data, 'mqttHost') ||
 		!Object.prototype.hasOwnProperty.call(data, 'mqttPass') ||

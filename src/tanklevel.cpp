@@ -27,13 +27,18 @@ extern "C" {
 }
 
 TANKLEVEL::TANKLEVEL(uint8_t dout, uint8_t pd_sck, gpio_num_t pin) {
-    hx711.begin(dout, pd_sck, 32);
+    hx711.begin(dout, pd_sck, HX711_GAIN);
     setAirPumpPIN(pin);
 }
 
 void TANKLEVEL::loop() {
+  if (setupConfig.start)
+  { 
+    beginLevelSetup();
+  }
+
   // Stop repressurizing the tube after X seconds
-  if (airPumpEnabled && runtime() - airPumpDurationMS > airPumpStarttime) {
+  if (airPumpEnabled && runtime() - (isSetupRunning() ? min(airPumpDurationMS, (uint64_t)timing.setupIntervalMs - WAIT_READING_AFTER_PUMP)  : airPumpDurationMS) > airPumpStarttime) {
     deactivateAirPump();
   }
 
@@ -43,30 +48,64 @@ void TANKLEVEL::loop() {
       timing.lastSetupRead = runtime();
       int val = runLevelSetup();
       if (!val) LOG_INFO_LN(F("[SENSOR] Unable to read data from sensor!"));
-    }
-  } else {
-    if (runtime() - timing.lastSensorRead >= timing.sensorIntervalMs) {
-      timing.lastSensorRead = runtime();
-      getCalulcatedMedianReading();
-      calculateLevel();
+      activateAirPump("Setup, keeping perfect pressure while filling up");
     }
   }
+  else
+  {
+    if (runtime() - timing.lastSensorRead >= timing.sensorIntervalMs && !airPumpEnabled && runtime() - airPumpEndtime >= WAIT_READING_AFTER_PUMP)
+    {
+      timing.lastSensorRead = runtime();
+      getCalulcatedMedianReading(false);
+      calculateLevel();
+      if (automaticAirPump && levelConfig.setupDone)
+      {
+        if (firstReadSincePump)
+        {
+          firstReadSincePump = false;
+          setPressurizeOnLevelNVS(getLevel() + repressurizeLevels, true);
+        }
+        else if (getLevel() >= levelConfig.pressurizeOnLevel)
+        {
+          activateAirPump("Tank is filling up");
+        }
+        else if (getLevel() <= levelConfig.pressurizeOnLevel - (repressurizeLevels * 2))
+        {
+          // tank is emptying and tube is losing pressure, update the level at which we need to repressurzize once we fill up again
+          setPressurizeOnLevelNVS(getLevel() + repressurizeLevels, true); 
+        }
+      }
+    }
+  }
+}
+
+bool TANKLEVEL::canSleep()
+{
+  return !isSetupRunning() 
+    && !airPumpEnabled
+    && !firstReadSincePump; // let it take one more fresh reading after pressurizing before deep sleeping
 }
 
 void TANKLEVEL::deactivateAirPump() {
   LOG_INFO_LN(F("[AIRPUMP] Shutting down"));
   airPumpEnabled = false;
   airPumpStarttime = 0;
+  airPumpEndtime = runtime();
+  firstReadSincePump = true;
   digitalWrite(airPumpPIN, LOW);
 
   levelConfig.airPressureOnFilling = airPressure;
-  updateAirPressureNVS(airPressure);
+  if (!isSetupRunning())
+  {
+    updateAirPressureNVS(airPressure);
+  }
 }
 
-void TANKLEVEL::activateAirPump() {
-  LOG_INFO_F("[AIRPUMP] Starting Air Pump on GPIO %d at runtime %" PRIu64 "\n", airPumpPIN, runtime());
+void TANKLEVEL::activateAirPump(String reason) {
+  LOG_INFO_F("[AIRPUMP] Starting Air Pump on GPIO %d at runtime %" PRIu64 ". Reason: %s\n", airPumpPIN, runtime(), reason.c_str());
   airPumpEnabled = true;
   airPumpStarttime = runtime();
+  airPumpEndtime = 0;
   digitalWrite(airPumpPIN, HIGH);
 }
 
@@ -117,6 +156,7 @@ bool TANKLEVEL::writeToNVS() {
     preferences.putDouble("offset", levelConfig.offset);
     preferences.putUInt("airpressure", levelConfig.airPressureOnFilling);
     preferences.putUInt("volume", levelConfig.volumeMilliLiters);
+    preferences.putUChar("pressurizelevel", levelConfig.pressurizeOnLevel);
 
     for (uint8_t i = 0; i <= 100; i++) {
       preferences.putInt(String("val" + String(i)).c_str(), levelConfig.readings[i]);
@@ -124,6 +164,7 @@ bool TANKLEVEL::writeToNVS() {
       // LOG_INFO_LN(levelConfig.readings[i]);
     }
     preferences.end();
+    LOG_INFO_LN("writeToNVS() - Config written to NVS");
     return true;
   } else {
     LOG_INFO_LN("writeToNVS() - Unable to write data to NVS, giving up...");
@@ -151,14 +192,13 @@ int TANKLEVEL::getLevelData(int perc) {
   } else return -1;
 }
 
-void TANKLEVEL::setSensorOffset(double newOffset, bool updateNVS) {
+void TANKLEVEL::setSensorOffset(double newOffset) {
   if (newOffset == 0.0) {
     LOG_INFO_LN(F("Reading the new offset from sensor"));
     newOffset = getSensorRawMedianReading(false);
   }
   levelConfig.offset = newOffset;
-  hx711.set_offset(levelConfig.offset);
-  if (updateNVS) updateOffsetNVS();
+  //hx711.set_offset(levelConfig.offset); // we aren't calling any function of the library which actually use the offet but calculate it ourself
 }
 
 void TANKLEVEL::begin(String ns) {
@@ -169,7 +209,8 @@ void TANKLEVEL::begin(String ns) {
   } else {
     levelConfig.setupDone = preferences.getBool("setupDone", false);
     levelConfig.airPressureOnFilling = preferences.getUInt("airpressure", 0);
-    setSensorOffset(preferences.getDouble("offset", 0.0), false);
+    levelConfig.pressurizeOnLevel = preferences.getUChar("pressurizelevel", 255);
+    setSensorOffset(preferences.getDouble("offset", 0.0));
 
     levelConfig.volumeMilliLiters = preferences.getUInt("volume", 0);
 
@@ -186,43 +227,38 @@ void TANKLEVEL::begin(String ns) {
 }
 
 bool TANKLEVEL::isSetupRunning() {
-  if (setupConfig.start) return beginLevelSetup();
-  return setupConfig.readings[0] > 0;
+  return setupConfig.running;
 }
 
 bool TANKLEVEL::isConfigured() {
-  if (setupConfig.start) { beginLevelSetup(); return false; }
   return levelConfig.setupDone;
 }
 
 double TANKLEVEL::getSensorRawMedianReading(bool cached) {
   if(cached) return lastRawReading;
   lastRawReading = hx711.read_median(10);
+  hasSensorError = lastRawReading == 0;
+  //LOG_INFO_F("Current sensor raw reading %.2f\n", lastRawReading);
   return lastRawReading;
 }
 
 int TANKLEVEL::getCalulcatedMedianReading(bool cached) {
   if (cached) return lastMedian;
-  lastMedian = (int)floor((getSensorRawMedianReading(false) - levelConfig.offset) / 1000);  
+  lastMedian = (int)round((getSensorRawMedianReading(false) - levelConfig.offset) / 100);  
   return lastMedian;
 }
 
 uint8_t TANKLEVEL::calculateLevel() {
   // Find the highest percentage of the current reading value
-  for(uint8_t x=100; x>0; x--) {
-    if (lastMedian >= levelConfig.readings[x]) {
-        if (tankWasEmpty && x > 25 && airPressure > 0) {
-          // just run it once when the tank get's filled up again to prevent unneccessary NVS writes
-          LOG_INFO_F("Storing new value of %d to compensate readings as the tank now gets filled up again.\n", airPressure);
-          tankWasEmpty = false;
-          levelConfig.airPressureOnFilling = airPressure;
-          updateAirPressureNVS(airPressure);
-        }
-        level = x;
-        return level;
+  if (levelConfig.setupDone)
+  {
+    for(uint8_t x=100; x>0; x--) {
+      if (lastMedian >= levelConfig.readings[x]) {
+          level = x;
+          return level;
+      }
     }
   }
-  tankWasEmpty = true;
   level = 0;
   return level;
 }
@@ -231,7 +267,7 @@ bool TANKLEVEL::updateAirPressureNVS(uint32_t newPressure) {
   if (preferences.begin(NVS.c_str(), false)) {
     // prevent unneccessary writes to NVS, only if there is a larger pressure difference
     uint32_t old = preferences.getUInt("airpressure");
-    if (old+NVS_WRITE_TOLERANCE_PA > newPressure && old-NVS_WRITE_TOLERANCE_PA < newPressure) {
+    if (old+NVS_WRITE_TOLERANCE_HPA > newPressure && old-NVS_WRITE_TOLERANCE_HPA < newPressure) {
       // only a minor change, we don't update the old value
     } else {
       preferences.putUInt("airpressure", newPressure);
@@ -241,6 +277,26 @@ bool TANKLEVEL::updateAirPressureNVS(uint32_t newPressure) {
     return true;
   } else {
     LOG_INFO_LN(F("updateAirPressureNVS() - Unable to write data to NVS, giving up..."));
+    return false;
+  }
+}
+
+bool TANKLEVEL::setPressurizeOnLevelNVS(uint8_t newLevel, bool writeNVS) {
+  levelConfig.pressurizeOnLevel = newLevel;
+  if (writeNVS && preferences.begin(NVS.c_str(), false))
+  {
+    uint8_t old = preferences.getUChar("pressurizelevel", 255);
+    if (old+NVS_WRITE_TOLERANCE_LEVEL > newLevel && old-NVS_WRITE_TOLERANCE_LEVEL < newLevel) {
+      // only a minor change, we don't update the old value
+    } else {
+      preferences.putUChar("pressurizelevel", newLevel);
+      LOG_INFO_LN(F("updatePressurizeOnLevelNVS - Wrote new level to NVS"));
+    }
+    preferences.putUChar("pressurizelevel", newLevel);
+    preferences.end();
+    return true;
+  } else {
+    LOG_INFO_LN(F("updatePressurizeOnLevelNVS() - Unable to write data to NVS, giving up..."));
     return false;
   }
 }
@@ -277,9 +333,11 @@ int TANKLEVEL::findStartCutoffIndex(int endIndex) {
 bool TANKLEVEL::beginLevelSetup() {
   setupConfig.start = false;
   if (!isSetupRunning()) {  // Start the level setup
+    setSensorOffset(0.0); // empty tank is always our sensor offset, so set the new offset here (0.0 means new reading)
+    setupConfig.running = true;
     setupConfig.valueCount = 0;
-    setupConfig.readings[setupConfig.valueCount++] = getCalulcatedMedianReading(false);
-    LOG_INFO_F("Begin level setup with minValue of %d\n", setupConfig.readings[0]);
+    setupConfig.readings[setupConfig.valueCount++] = 0; // just set the offset to the current reading, so this always 0 except for noise
+    LOG_INFO_F("Begin level setup with a sensor offset of %.02f\n", levelConfig.offset);
     return true;
   } else {
     LOG_INFO_LN("Level setup is already running");
@@ -289,18 +347,13 @@ bool TANKLEVEL::beginLevelSetup() {
 
 bool TANKLEVEL::abortLevelSetup() {
   LOG_INFO("Abort setup ... ");
-  setupConfig.valueCount = 0;
-  while(setupConfig.valueCount < MAX_DATA_POINTS) { // cleanup
-    setupConfig.readings[setupConfig.valueCount++] = 0;
-  }
   resetSetupData();
-  LOG_INFO_LN("done");
   return true;
 }
 
 void TANKLEVEL::resetSetupData() {
-  setupConfig.readings[0] = 0;
   setupConfig.valueCount = 0;
+  setupConfig.running = false;
   setupConfig.start = false;
   setupConfig.abort = false;
   setupConfig.end = false;
@@ -355,7 +408,8 @@ bool TANKLEVEL::endLevelSetup() {
     // LOG_INFO_F("Y=%d\t| Z = %d | z1=\t%f\t| z2=\t%f\n", Y, (int)Z, setupConfig.readings[x-1], setupConfig.readings[x]);
   }
   levelConfig.setupDone = true;
-  
+  levelConfig.pressurizeOnLevel = 100 +repressurizeLevels;
+  firstReadSincePump = false; 
   if (!writeToNVS()) return false;
 
   // cleanup
@@ -386,10 +440,10 @@ void TANKLEVEL::setAirPressure(int32_t hPa, bool runPumpIfPressureDifferenceIsLa
     if (automaticAirPump && runPumpIfPressureDifferenceIsLarge) {
       // Automatic repressurization is enabled.
       // Check if there is a larger difference from the stored air pressure value
-      if (levelConfig.airPressureOnFilling - airPressure > automatichAirPumpOnPressureDifferenceHPA
-       or airPressure - levelConfig.airPressureOnFilling > automatichAirPumpOnPressureDifferenceHPA) {
+      if (abs(levelConfig.airPressureOnFilling - airPressure) > automatichAirPumpOnPressureDifferenceHPA)
+      {
         // airPressure reduced more than X or increased more than X
-        activateAirPump();
+        activateAirPump("Atmospheric air pressure changed");
       }
     }
   } else if (hPa != 0) LOG_INFO_F("[ERROR] Invalid airpressure value given. Got %d\n", hPa);

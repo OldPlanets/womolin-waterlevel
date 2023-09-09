@@ -9,7 +9,7 @@
  * 
  * License: CC BY-NC-SA 4.0
  */
-
+#if HAS_DAC_INSTALLED
 #ifndef DAC_MIN_MVOLT
 #define DAC_MIN_MVOLT 500.0                 // DAC output minimum value (~0.5V on 0% tank level)
 #endif
@@ -53,3 +53,7 @@ uint8_t dacValue(uint8_t use_dac, uint8_t percentage) {
   }
   return val;
 }
+#else
+  bool enableDac = false;
+  uint8_t dacValue(uint8_t use_dac, uint8_t percentage) { return 0; }
+#endif

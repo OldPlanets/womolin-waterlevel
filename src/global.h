@@ -18,7 +18,6 @@
 #include <Preferences.h>
 #include "MQTTclient.h"
 #include "wifimanager.h"
-#include "otaWebUpdater.h"
 
 #define webserverPort 80                    // Start the Webserver on this port
 #define NVS_NAMESPACE "tanksensor"          // Preferences.h namespace to store settings
@@ -26,8 +25,7 @@
 #include <SPI.h>
 #include <Wire.h>
 
-OtaWebUpdater otaWebUpdater;
-bool enableOtaWebUpdate = true;             // Do automatic updates from web
+bool otaRunning = false;
 
 RTC_DATA_ATTR struct timing_t {
   // Check Services like MQTT, ...
@@ -43,15 +41,17 @@ RTC_DATA_ATTR uint64_t sleepTime = 0;       // Time that the esp32 slept
 
 WIFIMANAGER WifiManager;
 bool enableWifi = true;                     // Enable Wifi, disable to reduce power consumtion, stored in NVS
-
+u_int16_t shutDownWifiMin = 0;              // Shut down Wifi that many minutes after booting up (so poweroff/on can be used as replacement for the button to request wifi)
 bool enableBle = true;                      // Enable Ble, disable to reduce power consumtion, stored in NVS
+bool enableBleSleep = true;                 // If WiFi is off, sleep between advertising while no BLE client is connected
 
 #define LEVELMANAGERS 1
-TANKLEVEL LevelManager1(GPIO_NUM_33, GPIO_NUM_32, GPIO_NUM_19);
+TANKLEVEL LevelManager1(HX711_DT_PIN, HX711_SCK_PIN, (gpio_num_t)PUMP_PIN);
 TANKLEVEL * LevelManagers[LEVELMANAGERS] = {
   &LevelManager1
 };
 
+#if HAS_BUTTON_INSTALLED
 struct Button {
   const gpio_num_t PIN;
   bool pressed;
@@ -60,6 +60,7 @@ Button button1 = {GPIO_NUM_4, false};       // Run the setup (use a RTC GPIO)
 void IRAM_ATTR ISR_button1() {
   button1.pressed = true;
 }
+#endif
 
 String hostname;
 AsyncWebServer webServer(webserverPort);
@@ -84,7 +85,9 @@ void print_wakeup_reason() {
   switch(wakeup_reason) {
     case ESP_SLEEP_WAKEUP_EXT0 : 
       LOG_INFO_LN(F("[POWER] Wakeup caused by external signal using RTC_IO"));
+      #if HAS_BUTTON_INSTALLED
       button1.pressed = true;
+      #endif
     break;
     case ESP_SLEEP_WAKEUP_EXT1 : LOG_INFO_LN(F("[POWER] Wakeup caused by external signal using RTC_CNTL")); break;
     case ESP_SLEEP_WAKEUP_TIMER : 
@@ -103,28 +106,4 @@ void print_wakeup_reason() {
 
 // Check if a feature is enabled, that prevents the
 // deep sleep mode of our ESP32 chip.
-void sleepOrDelay() {
-  for (uint8_t i=0; i < LEVELMANAGERS; i++) {
-    if (LevelManagers[i]->isSetupRunning()) {
-      yield();
-      delay(50);
-      return;
-    }
-  }
-  if (enableWifi || enableBle || enableMqtt) {
-    yield();
-    delay(50);
-  } else {
-    // We can save a lot of power by going into deepsleep
-    // Thid disables WIFI and everything.
-    esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
-    sleepTime = rtc_time_slowclk_to_us(rtc_time_get(), esp_clk_slowclk_cal_get());
-    rtc_gpio_pullup_en(button1.PIN);
-    rtc_gpio_pulldown_dis(button1.PIN);
-    esp_sleep_enable_ext0_wakeup(button1.PIN, 0);
-
-    preferences.end();
-    LOG_INFO_LN(F("[POWER] Sleeping..."));
-    esp_deep_sleep_start();
-  }
-}
+void sleepOrDelay();

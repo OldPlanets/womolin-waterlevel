@@ -17,9 +17,9 @@
 #include <FS.h>
 #include <LittleFS.h>
 #include "ble.h"
-#include <Update.h>
 #include <esp_ota_ops.h>
 
+extern bool otaRunning;
 extern bool enableWifi;
 extern bool enableBle;
 extern bool enableMqtt;
@@ -97,6 +97,68 @@ void APIRegisterRoutes() {
     request->send(200, "application/json", output);
   });
 
+    webServer.on("/api/update/upload", HTTP_POST,
+    [&](AsyncWebServerRequest *request) { },
+    [&](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final) {
+
+    String otaPassword = "";
+    if (preferences.begin(NVS_NAMESPACE, true)) {
+      otaPassword = preferences.getString("otaPassword");
+      preferences.end();
+
+      if (otaPassword.length()) {
+        if(!request->authenticate("ota", otaPassword.c_str())) {
+          return request->send(401, "application/json", "{\"message\":\"Invalid OTA password provided!\"}");
+        }
+      } else LOG_INFO_LN(F("[OTA] No password configured, no authentication requested!"));
+    } else LOG_INFO_LN(F("[OTA] Unable to load password from NVS."));
+
+    if (!index) {
+      otaRunning = true;
+      LOG_INFO(F("[OTA] Begin firmware update with filename: "));
+      LOG_INFO_LN(filename);
+      // if filename includes spiffs|littlefs, update the spiffs|littlefs partition
+      int cmd = (filename.indexOf("spiffs") > -1 || filename.indexOf("littlefs") > -1) ? U_SPIFFS : U_FLASH;
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN, cmd)) {
+        LOG_INFO(F("[OTA] Error: "));
+        Update.printError(Serial);
+        request->send(500, "application/json", "{\"message\":\"Unable to begin firmware update!\"}");
+        otaRunning = false;
+      }
+    }
+
+    if (Update.write(data, len) != len) {
+      LOG_INFO(F("[OTA] Error: "));
+      Update.printError(Serial);
+      request->send(500, "application/json", "{\"message\":\"Unable to write firmware update data!\"}");
+      otaRunning = false;
+    }
+
+    if (final) {
+      if (!Update.end(true)) {
+        String output;
+        DynamicJsonDocument doc(32);
+        doc["message"] = "Update error";
+        doc["error"] = Update.errorString();
+        serializeJson(doc, output);
+        request->send(500, "application/json", output);
+
+        LOG_INFO_LN("[OTA] Error when calling calling Update.end().");
+        Update.printError(Serial);
+        otaRunning = false;
+      } else {
+        LOG_INFO_LN("[OTA] Firmware update successful.");
+        request->send(200, "application/json", "{\"message\":\"Please wait while the device reboots!\"}");
+        yield();
+        delay(250);
+
+        LOG_INFO_LN("[OTA] Update complete, rebooting now!");
+        Serial.flush();
+        ESP.restart();
+      }
+    }
+  });
+
   events.onConnect([&](AsyncEventSourceClient *client){
     if(client->lastId()){
       LOG_INFO_F("Client reconnected! Last message ID that it got is: %u\n", client->lastId());
@@ -161,9 +223,14 @@ void APIRegisterRoutes() {
       if (preferences.putBool("enableWifi", jsonBuffer["enableWifi"].as<boolean>())) {
         enableWifi = jsonBuffer["enableWifi"].as<boolean>();
       }
+      
+      preferences.putUShort("shutDownWifiMin", jsonBuffer["shutDownWifiMin"].as<uint16_t>());
+    
       if (preferences.putBool("enableSoftAp", jsonBuffer["enableSoftAp"].as<boolean>())) {
         WifiManager.fallbackToSoftAp(jsonBuffer["enableSoftAp"].as<boolean>());
       }
+
+      preferences.putString("softAPPassword", jsonBuffer["softAPPassword"].as<String>());  
 
       if (preferences.putBool("enableBle", jsonBuffer["enableBle"].as<boolean>())) {
         if (enableBle) stopBleServer();
@@ -172,15 +239,13 @@ void APIRegisterRoutes() {
         yield();
       }
 
+      #if HAS_DAC_INSTALLED
       if (preferences.putBool("enableDac", jsonBuffer["enableDac"].as<boolean>())) {
         enableDac = jsonBuffer["enableDac"].as<boolean>();
       }
+      #endif
 
-      preferences.putString("otaPassword", jsonBuffer["otaPassword"].as<String>());
-      preferences.putBool("otaWebEnabled", jsonBuffer["otaWebEnabled"].as<boolean>());
-      if (preferences.putString("otaWebUrl", jsonBuffer["otaWebUrl"].as<String>())) {
-        otaWebUpdater.setBaseUrl(jsonBuffer["otaWebUrl"].as<String>());
-      }    
+      preferences.putString("otaPassword", jsonBuffer["otaPassword"].as<String>());  
     
       if (preferences.putUInt("pressureThresh", jsonBuffer["pressureThresh"].as<uint16_t>()) ) {
         for (uint8_t i=0; i < LEVELMANAGERS; i++) {
@@ -230,7 +295,10 @@ void APIRegisterRoutes() {
       if (preferences.begin(NVS_NAMESPACE, true)) {
         doc["hostname"] = hostname;
         doc["enableWifi"] = enableWifi;
+        doc["shutDownWifiMin"] = preferences.getUShort("shutDownWifiMin", 0);
         doc["enableSoftAp"] = WifiManager.getFallbackState();
+        doc["softAPPassword"] = preferences.getString("softAPPassword");
+        
         doc["enableBle"] = enableBle;
         doc["enableDac"] = enableDac;
 
@@ -238,9 +306,6 @@ void APIRegisterRoutes() {
         doc["autoAirPump"] = preferences.getBool("autoAirPump", true);
         doc["airPumpOnBoot"] = preferences.getBool("airPumpOnBoot", true);
         doc["pressureThresh"] = preferences.getUInt("pressureThresh", 10);
-
-        doc["otaWebEnabled"] = preferences.getBool("otaWebEnabled", true);
-        doc["otaWebUrl"] = otaWebUpdater.getBaseUrl();
 
         // MQTT
         doc["enableMqtt"] = enableMqtt;
@@ -369,6 +434,9 @@ void APIRegisterRoutes() {
         jsonDoc[i]["volume"] = LevelManagers[i]->getCurrentVolume();
         jsonDoc[i]["sensorPressure"] = LevelManagers[i]->getLastMedian();
         jsonDoc[i]["airPressure"] = LevelManagers[i]->getAirPressure();
+        jsonDoc[i]["sensorRaw"] = LevelManagers[i]->getSensorRawMedianReading();
+        jsonDoc[i]["error"] = LevelManagers[i]->getSensorError();
+        jsonDoc[i]["configured"] = LevelManagers[i]->isConfigured();
     }
     serializeJson(jsonDoc, output);
     request->send(200, "application/json", output);

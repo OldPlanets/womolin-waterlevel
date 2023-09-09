@@ -23,6 +23,8 @@
 		}
 	});
 
+	let connected = false;
+	let disconnected = false;
 	onMount(async () => {
 		// dynamic refreshing level
 		if (window.EventSource) {
@@ -33,6 +35,8 @@
 				function (e) {
 					if (e.target.readyState != EventSource.OPEN) {
 						console.log('Events Disconnected');
+						connected = false;
+						disconnected = true;
 					}
 				},
 				false
@@ -51,6 +55,7 @@
 				function (e) {
 					try {
 						level = JSON.parse(e.data);
+						connected = true;
 					} catch (error) {
 						console.log(error);
 						console.log('Error parsing status', e.data);
@@ -84,12 +89,22 @@
 	{#if level == undefined}
 		<div class="col">Requesting current level, please wait...</div>
 	{:else if level.length == 0}
-		<div class="col">Please calibrate your Sensor...</div>
+		<div class="col">No sensors installed</div>
 	{:else}
 		{#each { length: level.length } as _, i}
-			<div class="col-sm-12">Current level of tank sensor {i + 1}</div>
+			{#if disconnected}
+				<div class="col-sm-12">Disconnected! Last level of tank sensor {i + 1}, Atmospheric pressure: {level[i].airPressure.toFixed(2)} hPa</div>				
+			{:else}
+				<div class="col-sm-12">Current level of tank sensor {i + 1}, Atmospheric pressure: {level[i].airPressure.toFixed(2)} hPa</div>
+			{/if}
 			<div class="col-sm-9">
-				<Progress animated value={level[i].level} style="height: 5rem;">{level[i].level}%<br />({Math.round(level[i].volume / 1000)} liter)</Progress>
+				{#if level[i].error }
+					<Progress striped color="danger" value={100} style="height: 5rem;">Sensor Error!</Progress>
+				{:else if !level[i].configured}
+					<Progress striped color="danger" value={100} style="height: 5rem;">Sensor not yet calibrated. Current Reading: {level[i].sensorPressure}</Progress>
+				{:else}
+					<Progress animated={connected} striped value={level[i].level} style="height: 5rem;">{level[i].level}%<br />({Math.round(level[i].volume / 1000)} liter)</Progress>
+				{/if}
 			</div>
 			<div class="col-sm-3">
 				<Button on:click={() => repressurizeTube(i)} block style="height: 5rem;">

@@ -13,8 +13,10 @@
 #ifndef TANKLEVEL_h
 #define TANKLEVEL_h
 
-#define NVS_WRITE_TOLERANCE_PA 250                 // Only write airpressure data to NVS if pressure difference is higher
-#define MAX_DATA_POINTS 255                        // how many level data points to store (increased accuracy)
+#define NVS_WRITE_TOLERANCE_HPA 2                 // Only write pressurizeOnLevel data to NVS if pressure difference is higher
+#define NVS_WRITE_TOLERANCE_LEVEL 3              // Only write airpressure data to NVS if pressure difference is higher
+#define MAX_DATA_POINTS 255                       // how many level data points to store (increased accuracy)
+#define WAIT_READING_AFTER_PUMP 1000              // Wait before taking a new reading that many ms after the pump was on
 #include <Arduino.h>
 #include <Preferences.h>
 #include <HX711.h>
@@ -28,24 +30,27 @@ class TANKLEVEL
 
         String NVS;                                // NVS Storage to write and read values
 
+        uint8_t repressurizeLevels = 10;           // Whenever the tank level increases this much without having been repressurized (air pump), do it to get the correct pressure for the sensor reading
+
         struct config_t {
             bool setupDone = false;                // Configuration done or not yet initialized sensor
             double offset = 0.0;                   // Offset (tare) value of an unpressurized sensor reading
             int airPressureOnFilling = 0;          // AirPressure Value at the time when filling the tank to compensate readings
             int readings[101] = {0};               // pressure readings to map to percentage filling 0% - 100%
             uint32_t volumeMilliLiters = 0;        // Tank volume in liters
+            uint8_t pressurizeOnLevel = 255;         // the tank level at which we need to repressurize the tube (by turning on the air pump)           
         } levelConfig;
 
         int lastMedian = 0;                        // The last reading median sensor value
         int airPressure = 0;                       // current air pressure in hPa
-        bool tankWasEmpty = false;                 // True, when the tank is empty to store new airPressure when filling again
+        bool hasSensorError = false;               // Sensor not connected / broken. We use a raw reading of 0.0 as indicator for that.
 
         struct state_t {
-            int start = false;                     // Async start the setup
-            int abort = false;                     // Async Abort current running setup
-            int end = false;                       // Async End current running setup
+            bool start = false;                     // Async start the setup
+            bool abort = false;                     // Async Abort current running setup
+            bool end = false;                       // Async End current running setup
+            bool running = false;                   // is the setup running
             int valueCount = 0;                    // current number of entries in readings[]
-            int minValue = 0.00;                   // lowest value to start recording
             int readings[MAX_DATA_POINTS] = {0};   // data readings from pressure sensor while running level setup
         } setupConfig;
 
@@ -74,8 +79,13 @@ class TANKLEVEL
         // Write current leveldata to non volatile storage
         bool writeToNVS();
 
+        bool setPressurizeOnLevelNVS(uint8_t newLevel, bool writeNVS);
+
         // Automatically enable the Air Pump if air pressure greatly increases or decreases
         bool automaticAirPump = true;
+
+        // first read after repressurizing
+        bool firstReadSincePump = false;
 
         // Enable the Air Pump if atmospheric pressure in hPa 
         uint16_t automatichAirPumpOnPressureDifferenceHPA = 10;
@@ -86,11 +96,14 @@ class TANKLEVEL
         // Time when the Air Pump was started
         uint64_t airPumpStarttime = 0;
 
+        // Time when the Air Pump was turned off
+        uint64_t airPumpEndtime = 0;
+
         // GPIO PIN that enables the Air Pump on HIGH
-        gpio_num_t airPumpPIN = GPIO_NUM_NC;
+        gpio_num_t airPumpPIN = (gpio_num_t)PUMP_PIN;
 
         // Runtime of the Air Pump in milliseconds
-        uint64_t airPumpDurationMS = 5000;
+        uint64_t airPumpDurationMS = DEFAUT_PUMP_TIME;
 
         // Set the level variable to 0-100 according to the current state of lastMedian
         // You need to call getCalulcatedMedianReading() before calculateLevel() to update lastMedian
@@ -116,7 +129,7 @@ class TANKLEVEL
         void setAirPumpDuration(uint64_t d) { airPumpDurationMS = d; }
 
         // Start/Activate the Air Pump
-        void activateAirPump();
+        void activateAirPump(String reason = "");
 
         // Stop/Deactivate the Air Pump
         void deactivateAirPump();
@@ -205,7 +218,7 @@ class TANKLEVEL
         uint64_t runtime();
 
         // Set a new sensor offset from current sensor reading
-        void setSensorOffset(double newOffset = 0.0, bool updateNVS = true);
+        void setSensorOffset(double newOffset = 0.0);
         
         // Get the current sensor offset value
         double getSensorOffset() { return levelConfig.offset; };
@@ -215,6 +228,13 @@ class TANKLEVEL
 
         // Get the current configured AirPressure
         int getAirPressure() { return airPressure; }
+
+        // Allowed to go into deep sleep or busy with something
+        bool canSleep();
+
+        void powerDownSensor() { hx711.power_down(); }
+        void powerUpSensor() { hx711.power_up(); }
+        bool getSensorError()  { return hasSensorError; }
 };
 
 #endif /* TANKLEVEL_h */

@@ -14,13 +14,28 @@
 
 #include "ble.h"
 #include <NimBLEDevice.h>
+#include <soc/rtc.h>
+extern "C" {
+  #if ESP_ARDUINO_VERSION_MAJOR >= 2
+    #include <esp32/clk.h>
+  #else
+    #include <esp_clk.h>
+  #endif
+}
 
-static NimBLEServer* pServer;
+static NimBLEServer* pServer = NULL;
+static uint64_t advertisementStarttime = 0;
 
 extern bool enableBle;
 
 void stopBleServer() {
-  NimBLEDevice::deinit();
+  NimBLEDevice::deinit(true);
+  pServer = NULL;
+}
+
+bool shouldBleStayOn()
+{
+  return pServer != NULL && (pServer->getConnectedCount() > 0 || (rtc_time_slowclk_to_us(rtc_time_get(), esp_clk_slowclk_cal_get()) / 1000) - advertisementStarttime < 1000);
 }
 
 void createBleServer(String hostname) {
@@ -53,6 +68,7 @@ void createBleServer(String hostname) {
   //pAdvertising->setScanResponse(true); // false will reduce power consumtion
   //pAdvertising->setAdvertisementType(BLE_GAP_CONN_MODE_DIR);
   NimBLEDevice::startAdvertising();
+  advertisementStarttime = rtc_time_slowclk_to_us(rtc_time_get(), esp_clk_slowclk_cal_get()) / 1000;
   LOG_INFO_LN(F("[BLE] Advertising Started"));
 }
 

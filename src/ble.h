@@ -17,6 +17,7 @@
 
 extern bool enableBle;
 
+bool shouldBleStayOn();
 void stopBleServer();
 void createBleServer(String hostname);
 void updateBleCharacteristic(uint8_t ch, int val);

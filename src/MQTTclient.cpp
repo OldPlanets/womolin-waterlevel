@@ -112,7 +112,10 @@ void MQTTclient::connect() {
   }
 }
 void MQTTclient::disconnect() {
-  client.disconnect();
+  if (client.connected())
+  {
+    client.disconnect();
+  }
 }
 
 /*
