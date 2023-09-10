@@ -1,3 +1,27 @@
+# What is different in this fork compared to the upstream/original repository:
+
+This fork is not (not yet anyway) supposed to be a ready to use version the way the original is, but work source for other devs.
+
+## Hardware:
+
+* Instead of the MPX53DP (discontinued) I’m using the MPX 2050DP as drop in. Even though it takes up to 16V, it works fine at 3.3V. Since it has half the output voltage range, I put it on the A instead of the B channel of the HX711 and use a gain of 64.
+* I’m using a bigger air pump which runs with 12V instead of 3.3V. Mainly because I didn’t find a smaller one, but it has the advantage that it only needs to run for half a second or less to pressurize the tube.
+* My measurement tube is one 4mm (inner diameter) tube, using quick connectors and a check valve right behind the air pump. It’s air tight and easier to install / make.
+* I’m using my ESP32 built in LED as Wifi status led.
+* I have no DAC output and no Wifi-Button connected
+
+
+## Software:
+
+* My device has no Wifi-On button, so in order to let it turn off Wifi (to save power) there is an option to turn off Wifi x minutes after the device has been turned on. This is esp. useful if you can turn on/off the device of the control panel of your RV (for example because its on the same circuit as the water pump)
+* When Wifi is off an BLE on, the device will deep sleep for 10 seconds and advertise itself over BLE for 1 second. This reduces the average power consumption quite a bit. I did actual measurements for power consumption per hour, but I didn’t keep the numbers, sorry :/ It was in the ballpark of 3-4 times less. However that means that connection to BLE takes up to 10 seconds. Once a client has been connected the device stays on until the client disconnects.
+* The autopump functionality has been expanded. It turns on when the tank gets filled, to proper pressurize the tube. It also runs after each measurement during calibration. In my experience/tests just filling in water does not result in the same pressure as repressurizing the tube, so that makes sure it’s always properly pressurized for exact readings.
+* You can set a password for the fallback AccessPoint functionality
+* The pin configuration of your hardware build can be set in the platformio.ini file
+* I removed the webupdate and reverted back to ArduinoOTA, because it is more convenient for me during development
+* Some bugfixes
+
+
 # womolin.tanklevel
 
 DIY project to build a smart tank level sensor for RVs or in other projects.
